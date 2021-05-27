@@ -1,54 +1,111 @@
+from collections import defaultdict
 from datetime import datetime, timedelta
 from traceback import format_exc
 from typing import Dict
+import io
+import requests
+import xmltodict
+import zipfile
 
-from sqlitedict import SqliteDict
+from multiprocessing.pool import ThreadPool
+from diskcache import Cache
 
-from .binance_api_manager import AllTickers, BinanceAPIManager
+from .binance_api_manager import BinanceAPIManager
+from .binance_stream_manager import BinanceOrder
 from .config import Config
 from .database import Database
 from .logger import Logger
 from .models import Coin, Pair
 from .strategies import get_strategy
 
-cache = SqliteDict("data/backtest_cache.db")
+cache = Cache("data")
 
 
-class FakeAllTickers(AllTickers):  # pylint: disable=too-few-public-methods
-    def __init__(self, manager: "MockBinanceManager"):  # pylint: disable=super-init-not-called
-        self.manager = manager
+def download(link):
+    r = requests.get(link, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0',
+        'Accept-Language': 'en-US,en;q=0.5', 'Origin': 'https://data.binance.vision',
+        'Referer': 'https://data.binance.vision/'})
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        f = z.infolist()[0]
+        return z.open(f).read()
 
-    def get_price(self, ticker_symbol):
-        return self.manager.get_market_ticker_price(ticker_symbol)
+
+def mergecsv(f):
+    res = []
+    for result in f.decode().split('\n'):
+        result = result.rstrip().split(',')
+        if len(result) >= 1 and result[0] != '':
+            res.append([float(x) for x in result])
+    return res
+
+
+def addtocache(link):
+    f = download(link)
+    lines = mergecsv(f)
+    ticker_symbol = link.split('klines/')[-1].split('/')[0]
+    for result in lines:
+        date = datetime.utcfromtimestamp(
+            result[0] / 1000).strftime("%d %b %Y %H:%M:%S")
+        price = float(result[1])
+        cache[f"{ticker_symbol} - {date}"] = price
 
 
 class MockBinanceManager(BinanceAPIManager):
     def __init__(
-        self,
-        config: Config,
-        db: Database,
-        logger: Logger,
-        start_date: datetime = None,
-        start_balances: Dict[str, float] = None,
+            self,
+            config: Config,
+            db: Database,
+            logger: Logger,
+            start_date: datetime = None,
+            start_balances: Dict[str, float] = None,
     ):
         super().__init__(config, db, logger)
         self.config = config
         self.datetime = start_date or datetime(2021, 1, 1)
         self.balances = start_balances or {config.BRIDGE.symbol: 100}
 
+    def setup_websockets(self):
+        pass  # No websockets are needed for backtesting
+
     def increment(self, interval=1):
         self.datetime += timedelta(minutes=interval)
-
-    def get_all_market_tickers(self):
-        """
-        Get ticker price of all coins
-        """
-        return FakeAllTickers(self)
 
     def get_fee(self, origin_coin: Coin, target_coin: Coin, selling: bool):
         return 0.0075
 
-    def get_market_ticker_price(self, ticker_symbol: str):
+    def get_historical_klines(self, ticker_symbol='ETCUSDT', interval='1m', target_date=None, end_date=None, limit=None,
+                              frame='daily'):
+        fromdate = datetime.strptime(
+            target_date, "%d %b %Y %H:%M:%S")  # - timedelta(days=1)
+        r = requests.get(
+            f'https://s3-ap-northeast-1.amazonaws.com/data.binance.vision?delimiter=/&prefix=data/spot/{frame}/klines/{ticker_symbol}/{interval}/',
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0',
+                     'Accept-Language': 'en-US,en;q=0.5', 'Origin': 'https://data.binance.vision',
+                     'Referer': 'https://data.binance.vision/'})
+        if 'ListBucketResult' not in r.content.decode():
+            return []
+        data = xmltodict.parse(r.content)
+        if 'Contents' not in data['ListBucketResult']:
+            return []
+        links = []
+        for i in data['ListBucketResult']['Contents']:
+            if 'CHECKSUM' in i['Key']:
+                continue
+            filedate = i['Key'].split(interval)[-1].split('.')[0]
+            if frame == 'daily':
+                filedate = datetime.strptime(filedate, "-%Y-%m-%d")
+            else:
+                filedate = datetime.strptime(filedate, "-%Y-%m")
+            if filedate.date().month == fromdate.date().month and filedate.date().year == fromdate.date().year:
+                links.append('https://data.binance.vision/' + i['Key'])
+        if len(links) == 0 and frame == 'daily':
+            return self.get_historical_klines(ticker_symbol, interval, target_date, end_date, limit, frame='monthly')
+        if len(links) >= 1:
+            pool = ThreadPool(8)
+            results = pool.map(addtocache, links)
+
+    def get_ticker_price(self, ticker_symbol: str):
         """
         Get ticker price of a specific coin
         """
@@ -60,31 +117,28 @@ class MockBinanceManager(BinanceAPIManager):
             if end_date > datetime.now():
                 end_date = datetime.now()
             end_date = end_date.strftime("%d %b %Y %H:%M:%S")
-            self.logger.info(f"Fetching prices for {ticker_symbol} between {self.datetime} and {end_date}")
-            for result in self.binance_client.get_historical_klines(
-                ticker_symbol, "1m", target_date, end_date, limit=1000
-            ):
-                date = datetime.utcfromtimestamp(result[0] / 1000).strftime("%d %b %Y %H:%M:%S")
-                price = float(result[1])
-                cache[f"{ticker_symbol} - {date}"] = price
-            cache.commit()
+            self.logger.info(
+                f"Fetching prices for {ticker_symbol} between {self.datetime} and {end_date}")
+            self.get_historical_klines(
+                ticker_symbol, "1m", target_date, end_date, limit=1000)
             val = cache.get(key, None)
         return val
 
-    def get_currency_balance(self, currency_symbol: str):
+    def get_currency_balance(self, currency_symbol: str, force=False):
         """
         Get balance of a specific coin
         """
         return self.balances.get(currency_symbol, 0)
 
-    def buy_alt(self, origin_coin: Coin, target_coin: Coin, all_tickers: AllTickers):
+    def buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float):
         origin_symbol = origin_coin.symbol
         target_symbol = target_coin.symbol
 
         target_balance = self.get_currency_balance(target_symbol)
-        from_coin_price = all_tickers.get_price(origin_symbol + target_symbol)
+        from_coin_price = self.get_ticker_price(origin_symbol + target_symbol)
 
-        order_quantity = self._buy_quantity(origin_symbol, target_symbol, target_balance, from_coin_price)
+        order_quantity = self._buy_quantity(
+            origin_symbol, target_symbol, target_balance, from_coin_price)
         target_quantity = order_quantity * from_coin_price
         self.balances[target_symbol] -= target_quantity
         self.balances[origin_symbol] = self.balances.get(origin_symbol, 0) + order_quantity * (
@@ -94,16 +148,25 @@ class MockBinanceManager(BinanceAPIManager):
             f"Bought {origin_symbol}, balance now: {self.balances[origin_symbol]} - bridge: "
             f"{self.balances[target_symbol]}"
         )
-        return {"price": from_coin_price}
 
-    def sell_alt(self, origin_coin: Coin, target_coin: Coin, all_tickers: AllTickers):
+        event = defaultdict(
+            lambda: None,
+            order_price=from_coin_price,
+            cumulative_quote_asset_transacted_quantity=0.0,
+            cumulative_filled_quantity=0.0,
+        )
+
+        return BinanceOrder(event)
+
+    def sell_alt(self, origin_coin: Coin, target_coin: Coin, sell_price: float):
         origin_symbol = origin_coin.symbol
         target_symbol = target_coin.symbol
 
         origin_balance = self.get_currency_balance(origin_symbol)
-        from_coin_price = all_tickers.get_price(origin_symbol + target_symbol)
+        from_coin_price = self.get_ticker_price(origin_symbol + target_symbol)
 
-        order_quantity = self._sell_quantity(origin_symbol, target_symbol, origin_balance)
+        order_quantity = self._sell_quantity(
+            origin_symbol, target_symbol, origin_balance)
         target_quantity = order_quantity * from_coin_price
         self.balances[target_symbol] = self.balances.get(target_symbol, 0) + target_quantity * (
             1 - self.get_fee(origin_coin, target_coin, True)
@@ -122,12 +185,12 @@ class MockBinanceManager(BinanceAPIManager):
                 total += balance
                 continue
             if coin == self.config.BRIDGE.symbol:
-                price = self.get_market_ticker_price(target_symbol + coin)
+                price = self.get_ticker_price(target_symbol + coin)
                 if price is None:
                     continue
                 total += balance / price
             else:
-                price = self.get_market_ticker_price(coin + target_symbol)
+                price = self.get_ticker_price(coin + target_symbol)
                 if price is None:
                     continue
                 total += price * balance
@@ -136,20 +199,20 @@ class MockBinanceManager(BinanceAPIManager):
 
 class MockDatabase(Database):
     def __init__(self, logger: Logger, config: Config):
-        super().__init__(logger, config, "sqlite:///")
+        super().__init__(logger, config, "sqlite:///", True)
 
     def log_scout(self, pair: Pair, target_ratio: float, current_coin_price: float, other_coin_price: float):
         pass
 
 
 def backtest(
-    start_date: datetime = None,
-    end_date: datetime = None,
-    interval=1,
-    yield_interval=100,
-    start_balances: Dict[str, float] = None,
-    starting_coin: str = None,
-    config: Config = None,
+        start_date: datetime = None,
+        end_date: datetime = None,
+        interval=1,
+        yield_interval=100,
+        start_balances: Dict[str, float] = None,
+        starting_coin: str = None,
+        config: Config = None,
 ):
     """
 
@@ -171,11 +234,13 @@ def backtest(
     db = MockDatabase(logger, config)
     db.create_database()
     db.set_coins(config.SUPPORTED_COIN_LIST)
-    manager = MockBinanceManager(config, db, logger, start_date, start_balances)
+    manager = MockBinanceManager(
+        config, db, logger, start_date, start_balances)
 
     starting_coin = db.get_coin(starting_coin or config.SUPPORTED_COIN_LIST[0])
     if manager.get_currency_balance(starting_coin.symbol) == 0:
-        manager.buy_alt(starting_coin, config.BRIDGE, manager.get_all_market_tickers())
+        # doesn't matter mocking manager don't look at fixed price
+        manager.buy_alt(starting_coin, config.BRIDGE, 0.0)
     db.set_current_coin(starting_coin)
 
     strategy = get_strategy(config.STRATEGY)

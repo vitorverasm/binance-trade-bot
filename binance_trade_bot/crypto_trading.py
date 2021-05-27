@@ -7,6 +7,7 @@ from .database import Database
 from .logger import Logger
 from .scheduler import SafeScheduler
 from .strategies import get_strategy
+from .database_warmup import warmup_database
 
 
 def main():
@@ -29,6 +30,7 @@ def main():
         return
     trader = strategy(manager, db, logger, config)
     logger.info(f"Chosen strategy: {config.STRATEGY}")
+    logger.info(f"Buy type: {config.BUY_ORDER_TYPE}, Sell type: {config.SELL_ORDER_TYPE}")
 
     logger.info("Creating database schema if it doesn't already exist")
     db.create_database()
@@ -36,6 +38,10 @@ def main():
     db.set_coins(config.SUPPORTED_COIN_LIST)
     db.migrate_old_state()
 
+    # Pre-operational scripts
+    warmup_database()
+
+    # Init trading
     trader.initialize()
 
     schedule = SafeScheduler(logger)
@@ -43,7 +49,9 @@ def main():
     schedule.every(1).minutes.do(trader.update_values).tag("updating value history")
     schedule.every(1).minutes.do(db.prune_scout_history).tag("pruning scout history")
     schedule.every(1).hours.do(db.prune_value_history).tag("pruning value history")
-
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    finally:
+        manager.stream_manager.close()

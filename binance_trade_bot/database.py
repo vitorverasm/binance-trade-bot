@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from collections import namedtuple
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import List, Optional, Union
@@ -14,16 +15,20 @@ from .config import Config
 from .logger import Logger
 from .models import *  # pylint: disable=wildcard-import
 
+LogScout = namedtuple("LogScout", ["pair", "target_ratio", "coin_price", "optional_coin_price"])
+
 
 class Database:
-    def __init__(self, logger: Logger, config: Config, uri="sqlite:///data/crypto_trading.db"):
+    def __init__(self, logger: Logger, config: Config, uri="sqlite:///data/crypto_trading.db", isTest=False):
         self.logger = logger
         self.config = config
         self.engine = create_engine(uri)
         self.SessionMaker = sessionmaker(bind=self.engine)
         self.socketio_client = Client()
+        self.isTest = isTest
 
     def socketio_connect(self):
+        if self.isTest: return False
         if self.socketio_client.connected and self.socketio_client.namespaces:
             return True
         try:
@@ -145,6 +150,24 @@ class Database:
             session.expunge_all()
             return pairs
 
+    def batch_log_scout(self, logs: List[LogScout]):
+        session: Session
+        with self.db_session() as session:
+            dt = datetime.now()
+            session.execute(
+                ScoutHistory.__table__.insert(),
+                [
+                    {
+                        "pair_id": ls.pair.id,
+                        "target_ratio": ls.target_ratio,
+                        "current_coin_price": ls.coin_price,
+                        "other_coin_price": ls.optional_coin_price,
+                        "datetime": dt,
+                    }
+                    for ls in logs
+                ],
+            )
+
     def log_scout(
         self,
         pair: Pair,
@@ -256,6 +279,24 @@ class Database:
 
             os.rename(".current_coin_table", ".current_coin_table.old")
             self.logger.info(".current_coin_table renamed to .current_coin_table.old - " "You can now delete this file")
+
+    def batch_update_coin_values(self, cv_batch: List[CoinValue]):
+        session: Session
+        with self.db_session() as session:
+            session.execute(
+                CoinValue.__table__.insert(),
+                [
+                    {
+                        "coin_id": cv.coin.symbol,
+                        "balance": cv.balance,
+                        "usd_price": cv.usd_price,
+                        "btc_price": cv.btc_price,
+                        "interval": cv.interval,
+                        "datetime": cv.datetime,
+                    }
+                    for cv in cv_batch
+                ],
+            )
 
 
 class TradeLog:
